@@ -27,7 +27,7 @@ from data_preprocessing_corrected import (
     PreprocessingArtifacts,
     SplitManifest
 )
-from training_pipeline import train_model
+from training_pipeline_corrected import train_model
 from evaluation_metrics import evaluate_model
 from dmlpffn_disease import DMLPFFN
 
