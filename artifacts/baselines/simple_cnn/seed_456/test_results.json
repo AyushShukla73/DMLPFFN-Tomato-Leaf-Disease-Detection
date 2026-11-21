@@ -1,0 +1,71 @@
+{
+  "patch_level": {
+    "accuracy": 0.5533834586466165,
+    "healthy_precision": 0.38095238095238093,
+    "healthy_recall": 0.05574912891986063,
+    "healthy_f1": 0.0972644376899696,
+    "late_precision": 0.565008025682183,
+    "late_recall": 0.9312169312169312,
+    "late_f1": 0.7032967032967034,
+    "macro_precision": 0.47298020331728197,
+    "macro_recall": 0.4934830300683959,
+    "macro_f1": 0.4002805704933365,
+    "weighted_precision": 0.485573484272479,
+    "weighted_recall": 0.5533834586466165,
+    "weighted_f1": 0.44174593603484985,
+    "confusion_matrix": [
+      [
+        32,
+        542
+      ],
+      [
+        52,
+        704
+      ]
+    ],
+    "confusion_matrix_labels": [
+      "Healthy",
+      "Late"
+    ],
+    "auc_roc_healthy": 0.46502313662592415,
+    "auc_roc_late": 0.4650231366259241,
+    "auc_roc_macro": 0.4650231366259241
+  },
+  "group_level": {
+    "group_accuracy": 0.5,
+    "num_groups": 4,
+    "group_confusion_matrix": [
+      [
+        0,
+        2
+      ],
+      [
+        0,
+        2
+      ]
+    ],
+    "group_confusion_matrix_labels": [
+      "Healthy",
+      "Late"
+    ],
+    "group_healthy_precision": 0.0,
+    "group_healthy_recall": 0.0,
+    "group_healthy_f1": 0.0,
+    "group_late_precision": 0.5,
+    "group_late_recall": 1.0,
+    "group_late_f1": 0.6666666666666666,
+    "group_macro_precision": 0.25,
+    "group_macro_recall": 0.5,
+    "group_macro_f1": 0.3333333333333333
+  },
+  "evaluation_protocol": "conditional_binary",
+  "num_samples": 1330,
+  "class_names": [
+    "Healthy",
+    "Late"
+  ],
+  "note": "Conditional binary evaluation: P(Healthy|Healthy/Late) = exp(z0)/(exp(z0)+exp(z3))",
+  "seed": 456,
+  "model": "simplecnn",
+  "num_parameters": 86156
+}

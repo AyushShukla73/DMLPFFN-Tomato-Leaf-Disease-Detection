@@ -6,6 +6,8 @@ Improvements over original:
 - Works with pre-configured DataLoaders (doesn't recreate them)
 - Proper reproducibility with seed handling
 - Better logging and metric tracking
+- Mixup/CutMix augmentation (Phase 3)
+- Label smoothing support (Phase 3)
 """
 
 import torch
@@ -17,6 +19,61 @@ from sklearn.utils.class_weight import compute_class_weight
 import numpy as np
 from config import cfg
 from dmlpffn_disease import DMLPFFN
+
+
+def mixup_data(x, y, alpha=1.0, device='cpu'):
+    """Apply mixup augmentation to a batch."""
+    if alpha > 0:
+        lam = np.random.beta(alpha, alpha)
+    else:
+        lam = 1.0
+
+    batch_size = x.size(0)
+    index = torch.randperm(batch_size).to(device)
+
+    mixed_x = lam * x + (1 - lam) * x[index, :]
+    y_a, y_b = y, y[index]
+
+    return mixed_x, y_a, y_b, lam
+
+
+def mixup_criterion(criterion, pred, y_a, y_b, lam):
+    """Compute mixup loss."""
+    return lam * criterion(pred, y_a) + (1 - lam) * criterion(pred, y_b)
+
+
+def cutmix_data(x, y, alpha=1.0, device='cpu'):
+    """Apply cutmix augmentation to a batch."""
+    if alpha > 0:
+        lam = np.random.beta(alpha, alpha)
+    else:
+        lam = 1.0
+
+    batch_size = x.size(0)
+    index = torch.randperm(batch_size).to(device)
+
+    # Generate random bounding box
+    W, H = x.size(2), x.size(3)
+    cut_rat = np.sqrt(1. - lam)
+    cut_w = int(W * cut_rat)
+    cut_h = int(H * cut_rat)
+
+    cx = np.random.randint(W)
+    cy = np.random.randint(H)
+
+    bbx1 = np.clip(cx - cut_w // 2, 0, W)
+    bby1 = np.clip(cy - cut_h // 2, 0, H)
+    bbx2 = np.clip(cx + cut_w // 2, 0, W)
+    bby2 = np.clip(cy + cut_h // 2, 0, H)
+
+    mixed_x = x.clone()
+    mixed_x[:, :, bbx1:bbx2, bby1:bby2] = x[index, :, bbx1:bbx2, bby1:bby2]
+
+    # Adjust lambda to match pixel ratio
+    lam = 1 - ((bbx2 - bbx1) * (bby2 - bby1) / (W * H))
+    y_a, y_b = y, y[index]
+
+    return mixed_x, y_a, y_b, lam
 
 
 class FocalLoss(nn.Module):
@@ -61,13 +118,20 @@ def train_model(
     optimizer_type: str = 'AdamW',
     loss_type: str = 'CrossEntropyLoss',
     lr: float = 2e-4,
-    weight_decay: float = 1e-4,
+    weight_decay: float = 5e-4,
     epochs: int = 250,
     patience: int = 25,
     scheduler_type: str = 'CosineAnnealingWarmRestarts',
     scheduler_params: dict = None,
     device: torch.device = None,
-    use_weighted_sampler: bool = True
+    use_weighted_sampler: bool = True,
+    label_smoothing: float = 0.1,
+    use_mixup: bool = True,
+    mixup_alpha: float = 0.2,
+    use_cutmix: bool = True,
+    cutmix_alpha: float = 1.0,
+    focal_alpha: float = 0.25,
+    focal_gamma: float = 2.0
 ):
     """
     Train the DMLPFFN model with proper device handling and logging.
@@ -86,6 +150,13 @@ def train_model(
         scheduler_params: Scheduler parameters
         device: Compute device (auto-detected if None)
         use_weighted_sampler: Whether to use WeightedRandomSampler for train loader
+        label_smoothing: Label smoothing factor for CrossEntropyLoss
+        use_mixup: Whether to apply mixup augmentation
+        mixup_alpha: Mixup alpha parameter
+        use_cutmix: Whether to apply cutmix augmentation
+        cutmix_alpha: CutMix alpha parameter
+        focal_alpha: Focal loss alpha parameter
+        focal_gamma: Focal loss gamma parameter
 
     Returns:
         (model, history)
@@ -134,9 +205,9 @@ def train_model(
 
     # Select loss function
     if loss_type == 'CrossEntropyLoss':
-        criterion = nn.CrossEntropyLoss(weight=class_weights)
+        criterion = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=label_smoothing)
     elif loss_type == 'FocalLoss':
-        criterion = FocalLoss()
+        criterion = FocalLoss(alpha=focal_alpha, gamma=focal_gamma)
     else:
         raise ValueError(f"Unsupported loss function: {loss_type}")
 
@@ -160,14 +231,31 @@ def train_model(
         for xb, yb in train_loader:
             xb, yb = xb.to(device), yb.to(device)
             opt.zero_grad()
+
+            # Apply Mixup or CutMix augmentation
+            use_aug = (use_mixup or use_cutmix) and np.random.rand() < 0.5
+            if use_aug and use_mixup and use_cutmix:
+                # Randomly choose between mixup and cutmix
+                if np.random.rand() < 0.5:
+                    xb, y_a, y_b, lam = mixup_data(xb, yb, mixup_alpha, device)
+                else:
+                    xb, y_a, y_b, lam = cutmix_data(xb, yb, cutmix_alpha, device)
+            elif use_aug and use_mixup:
+                xb, y_a, y_b, lam = mixup_data(xb, yb, mixup_alpha, device)
+            elif use_aug and use_cutmix:
+                xb, y_a, y_b, lam = cutmix_data(xb, yb, cutmix_alpha, device)
+            else:
+                y_a, y_b, lam = yb, yb, 1.0
+
             logits = model(xb)
-            loss = criterion(logits, yb)
+            loss = mixup_criterion(criterion, logits, y_a, y_b, lam)
             loss.backward()
             opt.step()
 
             train_loss += loss.item() * xb.size(0)
+            # For accuracy with mixup/cutmix, we use the original targets (y_a has original labels)
             preds = logits.argmax(1)
-            train_correct += (preds == yb).sum().item()
+            train_correct += (preds == y_a).sum().item()
             train_total += yb.size(0)
 
         train_loss /= train_total

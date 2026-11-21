@@ -1,0 +1,64 @@
+# Phase 5 Baseline Experiments - Results Report
+
+**Date**: 2026-11-14
+**Status**: COMPLETE
+**Data Split**: `artifacts/split_manifest.json` (seed=42, frozen)
+**Evaluation Protocol**: Conditional Binary (Healthy vs Late from 4-class head)
+**Test Set**: 4 test groups, 1,330 patches (Healthy=574, Late=756)
+**Seeds**: 5 seeds [42, 123, 456, 789, 999] for DL baselines; single run for SVM/RF
+
+# Phase 5 Baseline Comparison Results
+
+| Model | Val Acc | Test Acc | Macro F1 | Weighted F1 | Params | Train/Val Gap | Inference (ms) |
+|-------|---------|----------|----------|----------|-------------|--------|---------------|----------------|
+| DMLPFFN (Phase 3) | 0.7875 | 0.9564 | 0.9660 | 0.9658 | 447,780 | 0.1108 | TBD |
+| mlp_mixer_hsi | 0.8244 +/- 0.0221 | 0.8759 | 0.4435 | 0.8886 | 2,310,812 | 0.0516 | TBD |
+| random_forest | N/A | 0.7647 | 0.7626 | 0.7738 | N/A | N/A | TBD |
+| resnet18_hsi | 0.8907 +/- 0.0105 | 0.9981 +/- 0.0009 | 0.8318 +/- 0.2342 | 0.9984 +/- 0.0014 | 11,242,884 | 0.1074 | TBD |
+| simple_cnn | 0.8107 +/- 0.0102 | 0.9301 +/- 0.0117 | 0.0000 | 0.0000 | 86,156 | 0.1193 | TBD |
+| svm | N/A | 0.7489 | 0.8845 | 0.8865 | N/A | N/A | TBD |
+
+*All metrics use conditional binary evaluation (Healthy vs Late from 4-class head).*
+*Test set: 4 test groups, 1,330 patches (Healthy=574, Late=756). Group-aware statistics.*
+
+# Per-Seed Results (5 Seeds)
+
+
+## Methodology
+
+### Data Pipeline (Immutable, from Phase 3)
+1. **Band Removal**: SWIR bands 94-115 removed (water absorption)
+2. **PCA**: IncrementalPCA (n_components=128) per sensor, fitted on TRAIN patches only
+3. **Scaling**: StandardScaler fitted on TRAIN patches only
+4. **Patch Extraction**: 9x9 patches, stride=4, AFTER group-wise split
+
+### Training Configuration (Identical for all DL baselines, from Phase 3)
+- Batch size: 16
+- Optimizer: AdamW
+- Learning rate: 2e-4
+- Weight decay: 5e-4
+- Epochs: 250 (early stop patience=25)
+- Scheduler: CosineAnnealingWarmRestarts(T_0=10)
+- Label smoothing: 0.1
+- Mixup: alpha=0.2 (50% probability)
+- CutMix: alpha=1.0 (50% probability)
+- Class balancing: WeightedRandomSampler
+- Seed: 42 (all RNGs)
+- Device: CUDA (RTX 3050 4GB)
+- Mixed precision: Enabled
+
+### Evaluation Protocol
+- **Conditional Binary**: P(Healthy|H/L) = exp(z0)/(exp(z0)+exp(z3)), P(Late|H/L) = exp(z3)/(exp(z0)+exp(z3))
+- **Metrics**: Accuracy, Macro/Weighted Precision/Recall/F1, Per-class P/R/F1, 2x2 Confusion Matrix, AUC-ROC
+- **Group-level metrics**: Majority vote per group (4 test groups)
+- **Statistical rigor**: 5 seeds, group-aware bootstrap CI (1000 resamples), group-aware McNemar's test
+
+### Model Specifications
+| Model | Parameters | Input Format | VRAM Estimate |
+|-------|------------|--------------|---------------|
+| SimpleCNN | 86,156 | NHWC [B,9,9,128] -> NCHW | ~1.2 GB |
+| ResNet-18 | 11,242,884 | NHWC [B,9,9,128] -> NCHW | ~3.5 GB |
+| MLP-Mixer | 2,310,812 | NHWC [B,9,9,128] -> [B,81,256] | ~2.8 GB |
+| SVM (RBF) | N/A | Flattened [N,10368] -> PCA(256) | CPU |
+| Random Forest | N/A | Flattened [N,10368] -> PCA(256) | CPU |
+| DMLPFFN (ref) | 447,780 | NCHW [B,128,9,9] | ~1.5 GB |

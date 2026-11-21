@@ -1,0 +1,48 @@
+{
+  "experiment": "DMLPFFN_corrected",
+  "seed": 42,
+  "device": "cuda",
+  "training_time_seconds": 3557.6757895946503,
+  "dataset_shapes": {
+    "train": [
+      9254,
+      9,
+      9,
+      128
+    ],
+    "val": [
+      1694,
+      9,
+      9,
+      128
+    ],
+    "test": [
+      1330,
+      9,
+      9,
+      128
+    ]
+  },
+  "class_distributions": {
+    "train": {
+      "0": 1316,
+      "1": 756,
+      "2": 1512,
+      "3": 5670
+    },
+    "val": {
+      "0": 196,
+      "2": 182,
+      "3": 1316
+    },
+    "test": {
+      "0": 574,
+      "3": 756
+    }
+  },
+  "model_params": {
+    "total": 447780,
+    "trainable": 447780
+  },
+  "best_val_acc": 0.7874852420306966,
+  "best_val_epoch": 

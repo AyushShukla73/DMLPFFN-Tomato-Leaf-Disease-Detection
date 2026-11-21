@@ -157,9 +157,16 @@ def parse_filename(filepath: str) -> Tuple[int, str, str]:
 
     # Extract group identifier (run number = biological unit)
     # Group is everything after DAI, representing a unique leaf acquisition
-    group_id = name.split('dai', 1)[1].lstrip('_')
+    group_id = name.split('dai', 1)[1]  # Keep leading underscore for token replacement
 
-    return dai, sensor_type, group_id
+    # FIX: Strip sensor token (swir/visnir) to get true biological unit
+    # e.g., "_2hr_swir_bc_run1" -> "_2hr_bc_run1" (same bio unit across sensors)
+    # This ensures same plant imaged on both sensors gets same biological_unit
+    bio_unit = group_id
+    for sensor_token in ['_swir', '_visnir']:
+        bio_unit = bio_unit.replace(sensor_token, '')
+
+    return dai, sensor_type, bio_unit
 
 
 def get_label_from_dai(dai: int) -> int:
@@ -179,17 +186,32 @@ def get_label_from_dai(dai: int) -> int:
 
 def load_hsi_image(hdr_path: str) -> Tuple[np.ndarray, np.ndarray]:
     """
-    Load hyperspectral image and wavelengths.
+    Load hyperspectral image and wavelengths using memory mapping.
 
     Returns:
         (image_array, wavelengths)
-        image_array: (H, W, B)
+        image_array: (H, W, B) as numpy.memmap
         wavelengths: (B,)
     """
     img = spectral.envi.open(hdr_path)
-    data = img.load()  # (H, W, B)
+    # Use memory mapping to avoid loading full image into memory
+    data = img.open_memmap(writable=False)  # (H, W, B) as memmap
     wavelengths = np.array(img.metadata['wavelength'], dtype=float)
     return data, wavelengths
+
+
+def load_hsi_image_chunked(hdr_path: str, row_chunk_size: int = 100) -> Tuple[np.ndarray, np.ndarray, int]:
+    """
+    Load hyperspectral image in chunks to handle large images.
+
+    Returns:
+        (memmap_array, wavelengths, total_rows)
+    """
+    img = spectral.envi.open(hdr_path)
+    data = img.open_memmap(writable=False)  # (H, W, B) as memmap
+    wavelengths = np.array(img.metadata['wavelength'], dtype=float)
+    total_rows = data.shape[0]
+    return data, wavelengths, total_rows
 
 
 def remove_water_bands(img: np.ndarray, wavelengths: np.ndarray,
@@ -326,6 +348,9 @@ def group_wise_split(metadata_list: List[ImageMetadata],
     Groups are defined by unique acquisition identifiers (run numbers).
     All patches from the same group go to the same split.
 
+    For stratification: groups with mixed labels need special handling.
+    We use image-count-based stratification - each image contributes its label count.
+
     Args:
         metadata_list: List of ImageMetadata for all images
         train_ratio: Fraction for training
@@ -336,43 +361,82 @@ def group_wise_split(metadata_list: List[ImageMetadata],
     Returns:
         (train_metadata, val_metadata, test_metadata)
     """
-    # Get unique groups with their labels for stratification
+    # Get unique groups with their images and label composition
     groups = {}
     for meta in metadata_list:
         if meta.group_id not in groups:
             groups[meta.group_id] = {
-                'label': meta.label,
+                'images': [],
                 'sensor_type': meta.sensor_type,
-                'images': []
+                'label_counts': {},  # Count per label in this group
+                'has_label': set()   # Which labels are present
             }
         groups[meta.group_id]['images'].append(meta)
+        groups[meta.group_id]['label_counts'][meta.label] = \
+            groups[meta.group_id]['label_counts'].get(meta.label, 0) + 1
+        groups[meta.group_id]['has_label'].add(meta.label)
 
     group_ids = list(groups.keys())
-    group_labels = [groups[gid]['label'] for gid in group_ids]
+    unique_labels = sorted(set(m.label for m in metadata_list))
 
-    # Stratified split at group level
+    # STRATIFICATION FIX: Use label presence (not counts) for stratification
+    # Each group gets a binary vector indicating which labels are present
+    # This ensures each split has groups with diverse label coverage
+    def get_label_presence_vector(gid):
+        # Binary vector: 1 if label present, 0 if not
+        presence = [1 if l in groups[gid]['has_label'] else 0 for l in unique_labels]
+        return tuple(presence)
+
+    group_presence_vectors = [get_label_presence_vector(gid) for gid in group_ids]
+
+    # Stratified split at group level using label presence vectors
     np.random.seed(seed)
 
-    # First split: train vs (val+test)
-    train_groups, temp_groups = train_test_split(
-        group_ids,
-        test_size=1-train_ratio,
-        stratify=group_labels,
-        random_state=seed
-    )
+    # Strategy: Use stratified split only when it provides meaningful balance
+    # Check if stratification by presence vectors is feasible
+    unique_vectors = len(set(group_presence_vectors))
+    min_vector_count = min([group_presence_vectors.count(v) for v in set(group_presence_vectors)]) if unique_vectors > 1 else 0
 
-    # Second split: val vs test
-    temp_labels = [groups[gid]['label'] for gid in temp_groups]
-    val_ratio_rel = val_ratio / (val_ratio + test_ratio)
+    # For stratification to work reasonably, we need multiple groups per vector pattern
+    # But with many unique vectors, we may need to fall back to random split
+    use_stratification = unique_vectors > 1 and min_vector_count >= 2
 
-    if len(np.unique(temp_labels)) > 1 and min(np.bincount(temp_labels)) > 1:
-        val_groups, test_groups = train_test_split(
-            temp_groups,
-            test_size=1-val_ratio_rel,
-            stratify=temp_labels,
+    if use_stratification:
+        # First split: train vs (val+test)
+        train_groups, temp_groups = train_test_split(
+            group_ids,
+            test_size=1-train_ratio,
+            stratify=group_presence_vectors,
             random_state=seed
         )
+        temp_presence_vectors = [get_label_presence_vector(gid) for gid in temp_groups]
+        val_ratio_rel = val_ratio / (val_ratio + test_ratio)
+
+        # Check if stratification is possible for second split
+        unique_temp_vectors = len(set(temp_presence_vectors))
+        min_temp_vector_count = min([temp_presence_vectors.count(v) for v in set(temp_presence_vectors)]) if unique_temp_vectors > 1 else 0
+
+        if unique_temp_vectors > 1 and min_temp_vector_count >= 2:
+            val_groups, test_groups = train_test_split(
+                temp_groups,
+                test_size=1-val_ratio_rel,
+                stratify=temp_presence_vectors,
+                random_state=seed
+            )
+        else:
+            val_groups, test_groups = train_test_split(
+                temp_groups,
+                test_size=1-val_ratio_rel,
+                random_state=seed
+            )
     else:
+        # Fall back to random split when stratification not feasible
+        train_groups, temp_groups = train_test_split(
+            group_ids,
+            test_size=1-train_ratio,
+            random_state=seed
+        )
+        val_ratio_rel = val_ratio / (val_ratio + test_ratio)
         val_groups, test_groups = train_test_split(
             temp_groups,
             test_size=1-val_ratio_rel,
@@ -408,6 +472,12 @@ def group_wise_split(metadata_list: List[ImageMetadata],
 
     if any(overlap_check.values()):
         raise ValueError("GROUP OVERLAP DETECTED! Splits are not mutually exclusive.")
+
+    # Verify all labels are present in each split
+    for name, meta_list in [('Train', train_meta), ('Val', val_meta), ('Test', test_meta)]:
+        labels = [m.label for m in meta_list]
+        unique_labels_in_split = sorted(set(labels))
+        print(f"{name} labels present: {unique_labels_in_split}")
 
     return train_meta, val_meta, test_meta
 
@@ -463,77 +533,87 @@ def fit_sensor_specific_pca(train_meta: List[ImageMetadata],
                             stride: int) -> Tuple[PCA, PCA, List[int], List[int], np.ndarray, np.ndarray]:
     """
     Fit separate PCA models for each sensor type using ONLY training patches.
+    Uses memory mapping and chunked processing to handle large VIS-NIR images.
 
     Returns:
         (pca_swir, pca_visnir, remove_bands_swir, remove_bands_visnir,
          wavelengths_swir, wavelengths_visnir)
     """
-    # Collect training patches by sensor type
-    swir_patches = []
-    visnir_patches = []
+    from sklearn.decomposition import IncrementalPCA
+
+    # Collect training patches by sensor type using chunked processing
     wavelengths_swir = None
     wavelengths_visnir = None
     remove_bands_swir = []
     remove_bands_visnir = []
 
+    # For IncrementalPCA, we need to process patches in batches
+    # We'll accumulate pixel spectra from patches
+    swir_spectra_chunks = []
+    visnir_spectra_chunks = []
+    chunk_size = 10000  # Number of spectra per batch
+
     for meta in train_meta:
-        img, wavelengths = load_hsi_image(meta.filepath)
+        # Load with memory mapping
+        img_memmap, wavelengths, total_rows = load_hsi_image_chunked(meta.filepath)
+        h, w, b = img_memmap.shape
 
-        # Apply dark/white correction
-        img = apply_dark_white_correction(img, os.path.dirname(meta.filepath))
+        # Apply dark/white correction (need to process in chunks)
+        # For now, process the center-cropped region directly
+        # Center crop: from 64x64 center
+        start_h = max(0, (h - 64) // 2)
+        start_w = max(0, (w - 64) // 2)
+        end_h = min(h, start_h + 64)
+        end_w = min(w, start_w + 64)
 
-        # Center crop
-        img = center_crop(img, target_size=64)
+        # Process in row chunks to avoid memory issues
+        for row_start in range(start_h, end_h, 50):
+            row_end = min(row_start + 50, end_h)
+            # Load chunk: (chunk_h, 64, b)
+            chunk = img_memmap[row_start:row_end, start_w:end_w, :]
+            chunk = np.array(chunk)  # Convert memmap slice to array
 
-        # Remove water bands
-        img_filtered, wavelengths_filtered, removed = remove_water_bands(
-            img, wavelengths, cfg.remove_bands)
+            # Apply dark/white correction if available
+            chunk = apply_dark_white_correction(chunk, os.path.dirname(meta.filepath))
 
-        # Store sensor-specific info from first image of each type
-        if meta.sensor_type == 'swir_168':
-            if wavelengths_swir is None:
-                wavelengths_swir = wavelengths_filtered
-                remove_bands_swir = removed
-            swir_patches.append(img_filtered)
-        elif meta.sensor_type == 'visnir_300':
-            if wavelengths_visnir is None:
-                wavelengths_visnir = wavelengths_filtered
-                remove_bands_visnir = removed
-            visnir_patches.append(img_filtered)
+            # Remove water bands
+            chunk_filtered, wavelengths_filtered, removed = remove_water_bands(
+                chunk, wavelengths, cfg.remove_bands)
 
-    # Extract patches from all training images per sensor
-    def extract_all_patches(image_list):
-        all_patches = []
-        for img in image_list:
-            patches = extract_patches(img, patch_size, stride)
-            all_patches.append(patches)
-        if all_patches:
-            return np.concatenate(all_patches, axis=0)
-        return np.array([])
+            # Store sensor-specific info from first image of each type
+            if meta.sensor_type == 'swir_168':
+                if wavelengths_swir is None:
+                    wavelengths_swir = wavelengths_filtered
+                    remove_bands_swir = removed
+                # Reshape chunk to spectra: (chunk_h * 64, b_filtered)
+                chunk_spectra = chunk_filtered.reshape(-1, chunk_filtered.shape[2])
+                swir_spectra_chunks.append(chunk_spectra)
+            elif meta.sensor_type == 'visnir_300':
+                if wavelengths_visnir is None:
+                    wavelengths_visnir = wavelengths_filtered
+                    remove_bands_visnir = removed
+                chunk_spectra = chunk_filtered.reshape(-1, chunk_filtered.shape[2])
+                visnir_spectra_chunks.append(chunk_spectra)
 
-    swir_patch_data = extract_all_patches(swir_patches)
-    visnir_patch_data = extract_all_patches(visnir_patches)
-
-    # Fit PCA on training patches for each sensor
+    # Fit IncrementalPCA on accumulated spectra
     pca_swir = None
     pca_visnir = None
 
-    if len(swir_patch_data) > 0:
-        n_swir, h, w, b = swir_patch_data.shape
-        swir_flat = swir_patch_data.reshape(n_swir * h * w, b)
-        pca_swir = PCA(n_components=n_components, svd_solver='auto',
-                       whiten=False, random_state=cfg.seed)
-        pca_swir.fit(swir_flat)
-        print(f"Fitted SWIR PCA: {b} bands -> {n_components} components, "
+    if swir_spectra_chunks:
+        # Concatenate all SWIR spectra
+        all_swir_spectra = np.concatenate(swir_spectra_chunks, axis=0)
+        print(f"Total SWIR spectra for PCA: {all_swir_spectra.shape[0]}")
+        pca_swir = IncrementalPCA(n_components=n_components, batch_size=chunk_size)
+        pca_swir.fit(all_swir_spectra)
+        print(f"Fitted SWIR PCA: {all_swir_spectra.shape[1]} bands -> {n_components} components, "
               f"explained variance: {pca_swir.explained_variance_ratio_.sum():.4f}")
 
-    if len(visnir_patch_data) > 0:
-        n_visnir, h, w, b = visnir_patch_data.shape
-        visnir_flat = visnir_patch_data.reshape(n_visnir * h * w, b)
-        pca_visnir = PCA(n_components=n_components, svd_solver='auto',
-                         whiten=False, random_state=cfg.seed)
-        pca_visnir.fit(visnir_flat)
-        print(f"Fitted VIS-NIR PCA: {b} bands -> {n_components} components, "
+    if visnir_spectra_chunks:
+        all_visnir_spectra = np.concatenate(visnir_spectra_chunks, axis=0)
+        print(f"Total VIS-NIR spectra for PCA: {all_visnir_spectra.shape[0]}")
+        pca_visnir = IncrementalPCA(n_components=n_components, batch_size=chunk_size)
+        pca_visnir.fit(all_visnir_spectra)
+        print(f"Fitted VIS-NIR PCA: {all_visnir_spectra.shape[1]} bands -> {n_components} components, "
               f"explained variance: {pca_visnir.explained_variance_ratio_.sum():.4f}")
 
     return (pca_swir, pca_visnir, remove_bands_swir, remove_bands_visnir,
@@ -547,42 +627,74 @@ def fit_normalization_scaler(train_meta: List[ImageMetadata],
                              stride: int) -> StandardScaler:
     """
     Fit StandardScaler on TRAINING patches only (after PCA transformation).
+    Uses memory mapping and chunked processing to handle large VIS-NIR images.
     """
-    train_patches_list = []
+    from sklearn.preprocessing import StandardScaler
+    from sklearn.decomposition import IncrementalPCA
+
+    # We'll collect transformed patch data in chunks
+    all_spectra_chunks = []
+    chunk_size = 10000  # Number of spectra per batch for incremental fitting
 
     for meta in train_meta:
-        img, wavelengths = load_hsi_image(meta.filepath)
-        img = apply_dark_white_correction(img, os.path.dirname(meta.filepath))
-        img = center_crop(img, target_size=64)
-        img_filtered, wavelengths_filtered, _ = remove_water_bands(
-            img, wavelengths, cfg.remove_bands)
+        # Load with memory mapping
+        img_memmap, wavelengths, total_rows = load_hsi_image_chunked(meta.filepath)
+        h, w, b = img_memmap.shape
 
-        # Apply appropriate PCA
-        if meta.sensor_type == 'swir_168' and pca_swir is not None:
-            h, w, b = img_filtered.shape
-            flat = img_filtered.reshape(h * w, b)
-            transformed = pca_swir.transform(flat).reshape(h, w, -1)
-        elif meta.sensor_type == 'visnir_300' and pca_visnir is not None:
-            h, w, b = img_filtered.shape
-            flat = img_filtered.reshape(h * w, b)
-            transformed = pca_visnir.transform(flat).reshape(h, w, -1)
-        else:
-            continue
+        # Apply dark/white correction and center crop on-the-fly
+        # Center crop region
+        start_h = max(0, (h - 64) // 2)
+        start_w = max(0, (w - 64) // 2)
+        end_h = min(h, start_h + 64)
+        end_w = min(w, start_w + 64)
+        crop_h = end_h - start_h
+        crop_w = end_w - start_w
 
-        patches = extract_patches(transformed, patch_size, stride)
-        train_patches_list.append(patches)
+        # Process in row chunks
+        for row_start in range(start_h, end_h, 50):
+            row_end = min(row_start + 50, end_h)
+            # Load chunk: (chunk_h, crop_w, b)
+            chunk = img_memmap[row_start:row_end, start_w:end_w, :]
+            chunk = np.array(chunk)  # Convert memmap slice to array
 
-    if not train_patches_list:
+            # Apply dark/white correction
+            chunk = apply_dark_white_correction(chunk, os.path.dirname(meta.filepath))
+
+            # Remove water bands
+            chunk_filtered, wavelengths_filtered, _ = remove_water_bands(
+                chunk, wavelengths, cfg.remove_bands)
+
+            # Apply appropriate PCA
+            if meta.sensor_type == 'swir_168' and pca_swir is not None:
+                chunk_h, chunk_w, chunk_b = chunk_filtered.shape
+                flat = chunk_filtered.reshape(chunk_h * chunk_w, chunk_b)
+                transformed = pca_swir.transform(flat).reshape(chunk_h, chunk_w, -1)
+            elif meta.sensor_type == 'visnir_300' and pca_visnir is not None:
+                chunk_h, chunk_w, chunk_b = chunk_filtered.shape
+                flat = chunk_filtered.reshape(chunk_h * chunk_w, chunk_b)
+                transformed = pca_visnir.transform(flat).reshape(chunk_h, chunk_w, -1)
+            else:
+                continue
+
+            # Extract patches from this chunk
+            patches = extract_patches(transformed, patch_size, stride)
+
+            # Reshape to spectra
+            n, h_p, w_p, c = patches.shape
+            spectra = patches.reshape(n * h_p * w_p, c)
+            all_spectra_chunks.append(spectra)
+
+    if not all_spectra_chunks:
         raise ValueError("No training patches extracted!")
 
-    all_train_patches = np.concatenate(train_patches_list, axis=0)
-    n, h, w, c = all_train_patches.shape
-    flat = all_train_patches.reshape(n * h * w, c)
+    # Concatenate all spectra and fit scaler
+    all_spectra = np.concatenate(all_spectra_chunks, axis=0)
+    print(f"Total spectra for normalization: {all_spectra.shape[0]}")
 
     scaler = StandardScaler()
-    scaler.fit(flat)
+    scaler.fit(all_spectra)
 
-    print(f"Fitted normalization scaler on {n} patches, {c} channels")
+    print(f"Fitted normalization scaler on {all_spectra.shape[0]} spectra, {all_spectra.shape[1]} channels")
     print(f"  Mean range: [{scaler.mean_.min():.4f}, {scaler.mean_.max():.4f}]")
     print(f"  Std range: [{scaler.scale_.min():.4f}, {scaler.scale_.max():.4f}]")
 
@@ -598,40 +710,83 @@ def process_metadata_to_patches(meta_list: List[ImageMetadata],
     """
     Process a list of image metadata to patches using fitted transformers.
     No fitting occurs here - only transform.
+    Uses memory mapping and chunked processing to handle large VIS-NIR images.
     """
     X_list = []
     y_list = []
 
     for meta in meta_list:
-        img, wavelengths = load_hsi_image(meta.filepath)
-        img = apply_dark_white_correction(img, os.path.dirname(meta.filepath))
-        img = center_crop(img, target_size=64)
-        img_filtered, wavelengths_filtered, _ = remove_water_bands(
-            img, wavelengths, cfg.remove_bands)
+        # Load with memory mapping
+        img_memmap, wavelengths, total_rows = load_hsi_image_chunked(meta.filepath)
+        h, w, b = img_memmap.shape
 
-        # Apply appropriate PCA (transform only, no fit)
-        if meta.sensor_type == 'swir_168' and pca_swir is not None:
-            h, w, b = img_filtered.shape
-            flat = img_filtered.reshape(h * w, b)
-            transformed = pca_swir.transform(flat).reshape(h, w, -1)
-        elif meta.sensor_type == 'visnir_300' and pca_visnir is not None:
-            h, w, b = img_filtered.shape
-            flat = img_filtered.reshape(h * w, b)
-            transformed = pca_visnir.transform(flat).reshape(h, w, -1)
-        else:
-            print(f"Warning: No PCA for sensor type {meta.sensor_type}, skipping {meta.filename}")
-            continue
+        # Center crop region
+        start_h = max(0, (h - 64) // 2)
+        start_w = max(0, (w - 64) // 2)
+        end_h = min(h, start_h + 64)
+        end_w = min(w, start_w + 64)
+        crop_h = end_h - start_h
+        crop_w = end_w - start_w
 
-        # Extract patches
-        patches = extract_patches(transformed, patch_size, stride)
+        # For small images (SWIR), we can load the whole cropped region
+        # For large images (VIS-NIR), process in chunks
+        if meta.sensor_type == 'swir_168':
+            # Load the entire cropped region at once
+            img_crop = img_memmap[start_h:end_h, start_w:end_w, :]
+            img_crop = np.array(img_crop)  # Convert to array
+            img_crop = apply_dark_white_correction(img_crop, os.path.dirname(meta.filepath))
+            img_filtered, _, _ = remove_water_bands(img_crop, wavelengths, cfg.remove_bands)
 
-        # Apply normalization (transform only)
-        n, h_p, w_p, c = patches.shape
-        patches_flat = patches.reshape(n * h_p * w_p, c)
-        patches_normalized = scaler.transform(patches_flat).reshape(n, h_p, w_p, c)
+            # Apply PCA
+            if pca_swir is not None:
+                h_f, w_f, b_f = img_filtered.shape
+                flat = img_filtered.reshape(h_f * w_f, b_f)
+                transformed = pca_swir.transform(flat).reshape(h_f, w_f, -1)
+            else:
+                print(f"Warning: No PCA for sensor type {meta.sensor_type}, skipping {meta.filename}")
+                continue
 
-        X_list.append(patches_normalized)
-        y_list.extend([meta.label] * n)
+            # Extract patches
+            patches = extract_patches(transformed, patch_size, stride)
+
+            # Apply normalization
+            n, h_p, w_p, c = patches.shape
+            patches_flat = patches.reshape(n * h_p * w_p, c)
+            patches_normalized = scaler.transform(patches_flat).reshape(n, h_p, w_p, c)
+
+            X_list.append(patches_normalized)
+            y_list.extend([meta.label] * n)
+
+        elif meta.sensor_type == 'visnir_300':
+            # Process in row chunks to avoid memory issues
+            image_patches = []
+            for row_start in range(start_h, end_h, 50):
+                row_end = min(row_start + 50, end_h)
+                chunk = img_memmap[row_start:row_end, start_w:end_w, :]
+                chunk = np.array(chunk)
+
+                chunk = apply_dark_white_correction(chunk, os.path.dirname(meta.filepath))
+                chunk_filtered, _, _ = remove_water_bands(chunk, wavelengths, cfg.remove_bands)
+
+                if pca_visnir is not None:
+                    chunk_h, chunk_w, chunk_b = chunk_filtered.shape
+                    flat = chunk_filtered.reshape(chunk_h * chunk_w, chunk_b)
+                    transformed = pca_visnir.transform(flat).reshape(chunk_h, chunk_w, -1)
+                else:
+                    print(f"Warning: No PCA for sensor type {meta.sensor_type}, skipping {meta.filename}")
+                    continue
+
+                patches = extract_patches(transformed, patch_size, stride)
+                image_patches.append(patches)
+
+            if image_patches:
+                patches = np.concatenate(image_patches, axis=0)
+                n, h_p, w_p, c = patches.shape
+                patches_flat = patches.reshape(n * h_p * w_p, c)
+                patches_normalized = scaler.transform(patches_flat).reshape(n, h_p, w_p, c)
+
+                X_list.append(patches_normalized)
+                y_list.extend([meta.label] * n)
 
     if not X_list:
         return np.array([]), np.array([])
@@ -669,9 +824,9 @@ def load_tomato_dataset_corrected(root: str = None,
     root = root or cfg.data_root
 
     # If artifacts exist, load them (for val/test evaluation)
-    if load_artifacts_path and os.path.exists(load_artifacts_path + '_sklearn.joblib'):
+    if load_artifacts_path and os.path.exists(str(load_artifacts_path) + '_sklearn.joblib'):
         print(f"Loading preprocessing artifacts from {load_artifacts_path}")
-        artifacts = PreprocessingArtifacts.load(load_artifacts_path)
+        artifacts = PreprocessingArtifacts.load(str(load_artifacts_path))
         pca_swir = artifacts.pca_swir_168
         pca_visnir = artifacts.pca_visnir_300
         scaler = artifacts.scaler

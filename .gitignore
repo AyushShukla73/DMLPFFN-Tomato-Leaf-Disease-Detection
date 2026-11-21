@@ -1,0 +1,38 @@
+# Raw hyperspectral dataset (USDA DOI: 10.15482/USDA.ADC/26046328)
+# Exclude all raw ENVI format files and data directory
+tomato_leaf/
+*.bil
+*.hdr
+*.img
+
+# Preprocessing artifacts and caches
+*.joblib
+*.npz
+*.pkl
+*.cache
+__pycache__/
+*.pyc
+
+# macOS metadata
+._*
+.DS_Store
+__MACOSX/
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Python virtual environments
+venv/
+env/
+.venv/
+
+# Build and output directories
+build/
+dist/
+*.egg-info/
+
+# Logs
+*.log

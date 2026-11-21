@@ -66,7 +66,7 @@ def run_corrected_experiment():
     os.makedirs(artifacts_dir, exist_ok=True)
 
     artifacts_path = os.path.join(artifacts_dir, 'preprocessing_artifacts')
-    manifest_path = os.path.join(artifacts_dir, 'split_manifest.json')
+    manifest_path = os.path.join(artifacts_dir, 'split_manifest_frozen.json')
     results_path = os.path.join(artifacts_dir, 'experiment_results.json')
     model_path = os.path.join(artifacts_dir, 'best_model.pth')
 
@@ -150,7 +150,7 @@ def run_corrected_experiment():
     start_time = time.time()
 
     model, history = train_model(
-        dls=dls,
+        dataloaders=dls,
         in_ch=in_channels,
         num_classes=cfg.num_classes,
         optimizer_type=cfg.optimizer,
@@ -161,7 +161,15 @@ def run_corrected_experiment():
         patience=cfg.patience,
         scheduler_type=cfg.scheduler,
         scheduler_params=cfg.scheduler_params,
-        device=device
+        device=device,
+        use_weighted_sampler=True,
+        label_smoothing=cfg.label_smoothing,
+        use_mixup=cfg.use_mixup,
+        mixup_alpha=cfg.mixup_alpha,
+        use_cutmix=cfg.use_cutmix,
+        cutmix_alpha=cfg.cutmix_alpha,
+        focal_alpha=cfg.focal_alpha,
+        focal_gamma=cfg.focal_gamma
     )
 
     training_time = time.time() - start_time
@@ -211,9 +219,9 @@ def run_corrected_experiment():
             'test': list(X_test.shape),
         },
         'class_distributions': {
-            'train': dict(zip(*np.unique(y_train, return_counts=True))),
-            'val': dict(zip(*np.unique(y_val, return_counts=True))),
-            'test': dict(zip(*np.unique(y_test, return_counts=True))),
+            'train': {int(k): int(v) for k, v in zip(*np.unique(y_train, return_counts=True))},
+            'val': {int(k): int(v) for k, v in zip(*np.unique(y_val, return_counts=True))},
+            'test': {int(k): int(v) for k, v in zip(*np.unique(y_test, return_counts=True))},
         },
         'model_params': {
             'total': total_params,

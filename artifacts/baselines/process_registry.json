@@ -1,0 +1,45 @@
+{
+  "phase": "phase5",
+  "created": "2026-11-15T00:00:00Z",
+  "status": "running",
+  "active_process": {
+    "model": "resnet18_hsi",
+    "seed": 789,
+    "started_at": "CURRENT_TIME"
+  },
+  "running_seeds": ["resnet18_hsi:789"],
+  "completed_seeds": {
+    "mlp_mixer_hsi": [42, 123, 456, 789, 999],
+    "resnet18_hsi": [42, 123, 456, 789],
+    "simple_cnn": [42, 123, 456, 789, 999],
+    "svm_rbf": ["completed"],
+    "random_forest": ["completed"]
+  },
+  "missing_seeds": {
+    "mlp_mixer_hsi": [],
+    "resnet18_hsi": [999]
+  },
+  "interrupted_runs": {},
+  "gpu_info": {
+    "device": "cuda",
+    "memory_limit": "4GB",
+    "max_processes": 1
+  },
+  "training_config": {
+    "batch_size": 16,
+    "epochs": 250,
+    "patience": 25,
+    "lr": 2e-4,
+    "weight_decay": 5e-4,
+    "label_smoothing": 0.1,
+    "mixup_alpha": 0.2,
+    "cutmix_alpha": 1.0,
+    "mixup_prob": 0.5,
+    "cutmix_prob": 0.5,
+    "scheduler_T0": 10
+  },
+  "seeds_to_run": [999, 789, 999],
+  "models_pending": [
+    {"model": "resnet18_hsi", "seeds": [789, 999]}
+  ]
+}

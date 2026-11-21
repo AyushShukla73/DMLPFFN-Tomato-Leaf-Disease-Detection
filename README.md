@@ -38,7 +38,8 @@ https://doi.org/10.15482/USDA.ADC/26046328
   - 9×9 spectral–spatial patches  
   - Stride = 4  
   - ~12,700 total samples
-- **Stratified dataset split** (70/15/15)
+- **Stratified dataset split** (70/15/15) using group-wise split by biological unit
+- **Frozen split manifest** (`artifacts/split_manifest_frozen.json`) with verified no overlap between train/val/test groups
 - **DMLPFFN architecture**
   - Multi-branch *MLP-based* feature fusion (low, mid, high branches)
   - Local Perceptron with dilated operations for extended spatial perception

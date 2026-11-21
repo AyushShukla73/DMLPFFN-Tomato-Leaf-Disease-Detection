@@ -79,7 +79,7 @@ class DMLPBlock(nn.Module):
 
 # Main DMLPFFN network
 class DMLPFFN(nn.Module):
-    def __init__(self, in_channels=128, num_classes=4):
+    def __init__(self, in_channels=128, num_classes=4, dropout=0.7):
         super().__init__()
         # Low-level branch
         self.low_branch = nn.Sequential(
@@ -103,6 +103,7 @@ class DMLPFFN(nn.Module):
             nn.Conv2d(64, 64, 1)
         )
         self.gap = nn.AdaptiveAvgPool2d(1)
+        self.dropout = nn.Dropout(dropout)
         self.classifier = nn.Linear(64, num_classes)
 
     def forward(self, x):
@@ -112,5 +113,6 @@ class DMLPFFN(nn.Module):
         high = self.high_branch(x)
         fused = low + mid + high
         pooled = self.gap(fused).flatten(1)
+        pooled = self.dropout(pooled)
         out = self.classifier(pooled)
         return out
