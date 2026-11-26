@@ -160,7 +160,7 @@ def run_ablation_study(base_model_class, ablation_configs, dataloaders, device, 
     """Run ablation study with different model configurations."""
     results = []
 
-    for config_name, config in ablation_configs.items():
+    for config_name in ablation_configs.keys():
         print(f"\n{'='*60}")
         print(f"Ablation: {config_name}")
         print(f"{'='*60}")
@@ -168,13 +168,13 @@ def run_ablation_study(base_model_class, ablation_configs, dataloaders, device, 
         torch.manual_seed(seed)
         np.random.seed(seed)
 
-        model = get_ablation_model(config, in_channels=cfg.pca_components,
+        model = get_ablation_model(config_name, in_channels=cfg.pca_components,
                                    num_classes=cfg.num_classes, dropout=cfg.dropout)
 
         result = run_single_experiment(model, f"DMLPFFN_{config_name}", dataloaders, device, cfg, seed)
         if result:
             result['ablation_config'] = config_name
-            result['ablation_details'] = config
+            result['ablation_details'] = ablation_configs[config_name]
             results.append(result)
 
     return results
@@ -269,8 +269,13 @@ def run_phase5_experiment():
         if model_key == 'dmlpffn_full':
             model = dmlpffn_model
         else:
-            model = get_baseline_model(model_key, in_channels=cfg.pca_components,
-                                       num_classes=cfg.num_classes, dropout=cfg.dropout)
+            # Only pass dropout to models that accept it (mlp_mixer_hsi)
+            if model_key == 'mlp_mixer_hsi':
+                model = get_baseline_model(model_key, in_channels=cfg.pca_components,
+                                           num_classes=cfg.num_classes, dropout=cfg.dropout)
+            else:
+                model = get_baseline_model(model_key, in_channels=cfg.pca_components,
+                                           num_classes=cfg.num_classes)
 
         result = run_single_experiment(model, display_name, dataloaders, device, cfg, cfg.seed)
         if result:

@@ -36,3 +36,5 @@ dist/
 
 # Logs
 *.log
+# Oversized model checkpoint (kept locally, not published)
+/artifacts/baselines/resnet18_hsi/best_model.pth

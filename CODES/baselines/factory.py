@@ -12,12 +12,49 @@ from CODES.baselines.simple_cnn import SimpleCNN, count_parameters as count_para
 from CODES.baselines.resnet18_hsi import ResNet18_HSI, count_parameters as count_parameters_resnet18
 from CODES.baselines.mlp_mixer_hsi import MLPMixer_HSI, count_parameters as count_parameters_mlp_mixer
 from CODES.baselines.classical_ml import ClassicalMLBaselines
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+from sklearn.svm import SVC
+from sklearn.ensemble import RandomForestClassifier
 from CODES.config_baselines import EXPERIMENTS, DMLPFFN_REFERENCE, TrainingConfig, get_all_experiment_names
 
 
-def count_parameters(model: nn.Module) -> int:
-    """Unified parameter counting function."""
-    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+# Wrapper classes for classical ML to provide consistent interface
+class SVMPipeline(nn.Module):
+    """Wrapper for SVM pipeline to provide nn.Module-like interface."""
+    def __init__(self):
+        super().__init__()
+        self.pipeline = ClassicalMLBaselines.get_svm_pipeline()
+
+    def forward(self, x):
+        # x is expected to be [B, C, H, W] - flatten spatial dims
+        B, C, H, W = x.shape
+        x_flat = x.reshape(B, -1).cpu().numpy()
+        probs = self.pipeline.predict_proba(x_flat)
+        return torch.from_numpy(probs).float()
+
+
+class RandomForestPipeline(nn.Module):
+    """Wrapper for Random Forest pipeline to provide nn.Module-like interface."""
+    def __init__(self):
+        super().__init__()
+        self.pipeline = ClassicalMLBaselines.get_rf_pipeline()
+
+    def forward(self, x):
+        # x is expected to be [B, C, H, W] - flatten spatial dims
+        B, C, H, W = x.shape
+        x_flat = x.reshape(B, -1).cpu().numpy()
+        probs = self.pipeline.predict_proba(x_flat)
+        return torch.from_numpy(probs).float()
+
+
+def count_parameters(model: nn.Module):
+    """Unified parameter counting function.
+    Returns (total_params, trainable_params) tuple for backward compatibility.
+    """
+    total = sum(p.numel() for p in model.parameters())
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    return total, trainable
 
 
 def count_parameters_detailed(model: nn.Module) -> Dict[str, int]:
@@ -37,7 +74,7 @@ def get_baseline_model(name: str, in_channels: int = 128, num_classes: int = 4, 
     Factory function to create baseline models.
 
     Args:
-        name: Model name from EXPERIMENTS config (simplecnn, resnet18, mlp_mixer, svm, rf)
+        name: Model name from EXPERIMENTS config (simple_cnn, resnet18_hsi, mlp_mixer_hsi)
         in_channels: Input channels (PCA components)
         num_classes: Number of output classes
         **kwargs: Additional model-specific arguments
@@ -45,20 +82,18 @@ def get_baseline_model(name: str, in_channels: int = 128, num_classes: int = 4, 
     Returns:
         Initialized model
     """
-    if name not in EXPERIMENTS:
+    # Handle classical ML as special cases (not in EXPERIMENTS)
+    if name == 'svm':
+        return SVMPipeline()
+    elif name == 'rf' or name == 'random_forest':
+        return RandomForestPipeline()
+    elif name not in EXPERIMENTS:
         raise ValueError(f"Unknown model: {name}. Available: {get_all_experiment_names()}")
 
     exp = EXPERIMENTS[name]
     model_class_name = exp['model_class']
     module_name = exp['module']
     config = exp['config']
-
-    # Handle classical ML models
-    if name in ['svm', 'rf']:
-        if name == 'svm':
-            return ClassicalMLBaselines.get_svm_pipeline()
-        else:
-            return ClassicalMLBaselines.get_rf_pipeline()
 
     # Handle deep learning models - dynamically import the class
     module = __import__(module_name, fromlist=[model_class_name])
@@ -72,7 +107,17 @@ def get_baseline_model(name: str, in_channels: int = 128, num_classes: int = 4, 
     # Add config-specific parameters
     if hasattr(config, '__dict__'):
         for key, value in config.__dict__.items():
-            if key not in ['expected_params', 'name', 'expected_vram_gb', 'input_format', 'num_classes', 'in_channels']:  # Skip metadata
+            # Skip metadata fields that aren't model constructor args
+            if key not in [
+                'expected_params', 'name', 'expected_vram_gb',
+                'input_format', 'num_classes', 'in_channels',
+                'use_pretrained', 'conv1_kernel_size', 'conv1_stride',
+                'conv1_padding', 'remove_maxpool', 'fallback_batch_size',
+                'fallback_grad_accum', 'pca_components', 'kernel', 'C', 'gamma',
+                'class_weight', 'probability', 'random_state', 'n_estimators',
+                'max_depth', 'n_jobs', 'dropout', 'token_mixing_dim',
+                'channel_mixing_dim', 'num_blocks', 'embedding_dim', 'patch_size'
+            ]:
                 model_kwargs[key] = value
 
     # Override with any explicit kwargs
@@ -105,89 +150,113 @@ from CODES.dmlpffn_disease import DMLPFFN, DMLPBlock, GlobalPerceptron, Partitio
 class DMLPFFNAblation(nn.Module):
     """
     Ablation version of the ACTUAL DMLPFFN architecture.
-    Allows selective removal of Global, Partition, and Local branches.
+    The actual DMLPFFN has 3 parallel branches (low, mid, high), each with DMLPBlock.
+    DMLPBlock combines GlobalPerceptron, PartitionPerceptron, LocalPerceptron.
+
+    This ablation allows:
+    - Removing low/mid/high branches
+    - Removing individual perceptrons within DMLPBlock
+    - Changing fusion mode
     """
     def __init__(
         self,
         in_channels: int = 128,
         num_classes: int = 4,
-        base_channels: int = 48,
-        num_blocks: int = 4,
         dropout: float = 0.7,
+        use_low: bool = True,
+        use_mid: bool = True,
+        use_high: bool = True,
+        # Within DMLPBlock: enable/disable individual perceptrons
         use_global: bool = True,
         use_partition: bool = True,
         use_local: bool = True,
-        global_dilations: List[int] = [1, 2, 5],
-        partition_dilations: List[int] = [1, 2, 5],
-        local_dilations: List[int] = [1, 2, 5],
+        # Fusion mode: 'add' or 'concat'
         fusion_mode: str = 'add',
+        # Dilation rates for LocalPerceptron
+        dilation_rates: List[int] = None,
+        # Channel dimensions for each branch
+        low_channels: int = 16,
+        mid_channels: int = 32,
+        high_channels: int = 64,
+        branch_output_channels: int = 64,  # Output channels per branch (before fusion)
+        fused_channels: int = None,  # Auto-computed if None
     ):
         super().__init__()
         self.in_channels = in_channels
         self.num_classes = num_classes
-        self.base_channels = base_channels
-        self.num_blocks = num_blocks
         self.dropout = dropout
+        self.use_low = use_low
+        self.use_mid = use_mid
+        self.use_high = use_high
         self.use_global = use_global
         self.use_partition = use_partition
         self.use_local = use_local
         self.fusion_mode = fusion_mode
+        self.dilation_rates = dilation_rates if dilation_rates is not None else [1, 2, 5]
 
-        # Calculate output channels per branch
-        # Global: base_channels * 4 (expansion factor 4)
-        # Partition: base_channels * 2 (expansion factor 2)
-        # Local: base_channels (expansion factor 1)
+        # Auto-compute fused_channels based on fusion_mode if not specified
+        # Each branch outputs 'branch_output_channels' channels
+        # For 'add' fusion: final channels = branch_output_channels (64)
+        # For 'concat' fusion: final channels = 3 * branch_output_channels (192)
+        if fused_channels is None:
+            if fusion_mode == 'concat':
+                fused_channels = 3 * branch_output_channels
+            else:
+                fused_channels = branch_output_channels
 
-        self.global_out = base_channels * 4 if use_global else 0
-        self.partition_out = base_channels * 2 if use_partition else 0
-        self.local_out = base_channels if use_local else 0
-
-        fused_channels = self.global_out + self.partition_out + self.local_out
-        if fused_channels == 0:
-            raise ValueError("At least one branch must be enabled")
-
-        # Branch modules
-        if use_global:
-            self.global_branch = GlobalPerceptron(
-                in_channels=in_channels,
-                out_channels=self.global_out,
-                expansion=4,
-                dropout=dropout,
+        # Low-level branch
+        if use_low:
+            self.low_branch = nn.Sequential(
+                nn.Conv2d(in_channels, low_channels, 3, padding=1),
+                nn.BatchNorm2d(low_channels),
+                nn.ReLU(inplace=True),
+                AblationDMLPBlock(
+                    in_channels=low_channels,
+                    out_channels=low_channels,
+                    use_global=use_global,
+                    use_partition=use_partition,
+                    use_local=use_local,
+                    dilation_rates=self.dilation_rates,
+                ),
+                nn.Conv2d(low_channels, branch_output_channels, 1)
             )
 
-        if use_partition:
-            self.partition_branch = PartitionPerceptron(
-                in_channels=in_channels,
-                out_channels=self.partition_out,
-                expansion=2,
-                dropout=dropout,
+        # Middle-level branch
+        if use_mid:
+            self.mid_branch = nn.Sequential(
+                nn.Conv2d(in_channels, mid_channels, 5, padding=2),
+                nn.BatchNorm2d(mid_channels),
+                nn.ReLU(inplace=True),
+                AblationDMLPBlock(
+                    in_channels=mid_channels,
+                    out_channels=mid_channels,
+                    use_global=use_global,
+                    use_partition=use_partition,
+                    use_local=use_local,
+                    dilation_rates=self.dilation_rates,
+                ),
+                nn.Conv2d(mid_channels, branch_output_channels, 1)
             )
 
-        if use_local:
-            self.local_branch = LocalPerceptron(
-                in_channels=in_channels,
-                out_channels=self.local_out,
-                dropout=dropout,
+        # High-level branch
+        if use_high:
+            self.high_branch = nn.Sequential(
+                AblationDMLPBlock(
+                    in_channels=in_channels,
+                    out_channels=high_channels,
+                    use_global=use_global,
+                    use_partition=use_partition,
+                    use_local=use_local,
+                    dilation_rates=self.dilation_rates,
+                ),
+                nn.Conv2d(high_channels, branch_output_channels, 1)
             )
 
-        # DMLP blocks for processing fused features
-        self.blocks = nn.ModuleList([
-            DMLPBlock(
-                in_channels=fused_channels,
-                out_channels=fused_channels,
-                dilations=global_dilations,  # Use global dilations for fused processing
-                dropout=dropout,
-                expansion=2,
-            )
-            for _ in range(num_blocks)
-        ])
+        self.fused_channels = fused_channels
 
-        # Final classification head
-        self.global_pool = nn.AdaptiveAvgPool2d(1)
-        self.classifier = nn.Sequential(
-            nn.Dropout(dropout),
-            nn.Linear(fused_channels, num_classes)
-        )
+        self.gap = nn.AdaptiveAvgPool2d(1)
+        self.dropout = nn.Dropout(dropout)
+        self.classifier = nn.Linear(self.fused_channels, num_classes)
 
         self._init_weights()
 
@@ -206,234 +275,449 @@ class DMLPFFNAblation(nn.Module):
                     nn.init.zeros_(m.bias)
 
     def forward(self, x):
-        """
-        x: [B, C, H, W] - NCHW format
-        """
         branch_outputs = []
 
-        if self.use_global:
-            global_feat = self.global_branch(x)
-            branch_outputs.append(global_feat)
+        if self.use_low:
+            branch_outputs.append(self.low_branch(x))
+        if self.use_mid:
+            branch_outputs.append(self.mid_branch(x))
+        if self.use_high:
+            branch_outputs.append(self.high_branch(x))
 
-        if self.use_partition:
-            partition_feat = self.partition_branch(x)
-            branch_outputs.append(partition_feat)
-
-        if self.use_local:
-            local_feat = self.local_branch(x)
-            branch_outputs.append(local_feat)
-
-        # Fusion
-        if self.fusion_mode == 'add':
-            if len(branch_outputs) == 1:
-                fused = branch_outputs[0]
-            else:
-                fused = branch_outputs[0]
-                for feat in branch_outputs[1:]:
-                    fused = fused + feat
-        elif self.fusion_mode == 'concat':
+        # Fuse branches by fusion_mode
+        if self.fusion_mode == 'concat':
             fused = torch.cat(branch_outputs, dim=1)
         else:
-            raise ValueError(f"Unknown fusion_mode: {self.fusion_mode}")
+            fused = branch_outputs[0]
+            for feat in branch_outputs[1:]:
+                fused = fused + feat
 
-        # Process through DMLP blocks
-        for block in self.blocks:
-            fused = block(fused)
-
-        # Global average pooling and classification
-        pooled = self.global_pool(fused).flatten(1)
+        pooled = self.gap(fused).flatten(1)
+        pooled = self.dropout(pooled)
         out = self.classifier(pooled)
         return out
 
 
+class LocalPerceptronAblation(nn.Module):
+    """Local Perceptron with configurable dilation rates."""
+
+    def __init__(self, in_channels: int, out_channels: int, dilation_rates: List[int] = None):
+        super().__init__()
+        self.dilation_rates = dilation_rates if dilation_rates is not None else [1, 2, 5]
+        self.dilated_convs = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv2d(in_channels, out_channels, 3, padding=d, dilation=d),
+                nn.BatchNorm2d(out_channels)
+            ) for d in self.dilation_rates
+        ])
+
+    def forward(self, x):
+        return sum([conv(x) for conv in self.dilated_convs])
+
+
+class AblationDMLPBlock(nn.Module):
+    """
+    Ablation version of DMLPBlock that can selectively disable
+    Global, Partition, and Local perceptrons.
+    """
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        use_global: bool = True,
+        use_partition: bool = True,
+        use_local: bool = True,
+        dilation_rates: List[int] = None,
+    ):
+        super().__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.use_global = use_global
+        self.use_partition = use_partition
+        self.use_local = use_local
+        self.dilation_rates = dilation_rates if dilation_rates is not None else [1, 2, 5]
+
+        # Perceptrons (only create if enabled)
+        if use_global:
+            self.global_perc = GlobalPerceptron(in_channels, out_channels)
+        if use_partition:
+            self.partition_perc = PartitionPerceptron(in_channels, out_channels)
+        if use_local:
+            self.local_perc = LocalPerceptronAblation(in_channels, out_channels, self.dilation_rates)
+
+        self.shortcut = nn.Conv2d(in_channels, out_channels, 1)
+        self.bn = nn.BatchNorm2d(out_channels)
+        self.relu = nn.ReLU(inplace=True)
+
+    def forward(self, x):
+        branch_outputs = []
+
+        if self.use_global:
+            g = self.global_perc(x)
+            branch_outputs.append(g.unsqueeze(-1).unsqueeze(-1))  # Expand to spatial
+
+        if self.use_partition:
+            p = self.partition_perc(x)
+            branch_outputs.append(p)
+
+        if self.use_local:
+            l = self.local_perc(x)
+            branch_outputs.append(l)
+
+        # Fuse available branches
+        if not branch_outputs:
+            # Fallback: just shortcut
+            fused = self.shortcut(x)
+            fused = self.bn(fused)
+            return self.relu(fused)
+
+        # Apply fusion mode
+        if len(branch_outputs) == 1:
+            fused = branch_outputs[0]
+        else:
+            # Check if we should use concat (only valid when multiple spatial outputs exist)
+            # Global perceptron produces 2D output that needs broadcasting
+            spatial_outputs = []
+            global_outputs = []
+            for name, out in branch_outputs if isinstance(branch_outputs[0], tuple) else [(None, branch_outputs[0])]:
+                pass
+
+            # For simplicity in DMLPBlock context, always use addition
+            # Concat fusion is handled at the DMLPFFNAblation level
+            fused = branch_outputs[0]
+            for feat in branch_outputs[1:]:
+                fused = fused + feat
+
+        # Add residual
+        fused = fused + self.shortcut(x)
+
+        # BatchNorm and ReLU
+        fused = self.bn(fused)
+        fused = self.relu(fused)
+
+        return fused
+
+
 # Ablation configurations for the ACTUAL DMLPFFN architecture
+# The new architecture has:
+# - 3 parallel branches: low, mid, high
+# - Each branch has AblationDMLPBlock with Global/Partition/Local perceptrons
+# - DMLPFFNAblation enables/disables branches and perceptrons within blocks
 DMLPFFN_ABLATION_CONFIGS = {
-    # Full model (reference)
+    # Full model (reference) - all branches and all perceptrons
     'full': {
+        'use_low': True,
+        'use_mid': True,
+        'use_high': True,
         'use_global': True,
         'use_partition': True,
         'use_local': True,
-        'fusion_mode': 'add',
-        'global_dilations': [1, 2, 5],
-        'partition_dilations': [1, 2, 5],
-        'local_dilations': [1, 2, 5],
-        'num_blocks': 4,
-        'base_channels': 48,
+        'low_channels': 16,
+        'mid_channels': 32,
+        'high_channels': 64,
+        'fused_channels': 64,
         'dropout': 0.7,
     },
-    # Single branch ablations
-    'only_global': {
+    # Single branch ablations (keep all perceptrons in that branch)
+    'only_low': {
+        'use_low': True,
+        'use_mid': False,
+        'use_high': False,
         'use_global': True,
-        'use_partition': False,
-        'use_local': False,
-        'fusion_mode': 'add',
-        'global_dilations': [1, 2, 5],
-        'partition_dilations': [1, 2, 5],
-        'local_dilations': [1, 2, 5],
-        'num_blocks': 4,
-        'base_channels': 48,
-        'dropout': 0.7,
-    },
-    'only_partition': {
-        'use_global': False,
         'use_partition': True,
-        'use_local': False,
-        'fusion_mode': 'add',
-        'global_dilations': [1, 2, 5],
-        'partition_dilations': [1, 2, 5],
-        'local_dilations': [1, 2, 5],
-        'num_blocks': 4,
-        'base_channels': 48,
+        'use_local': True,
+        'low_channels': 16,
+        'mid_channels': 32,
+        'high_channels': 64,
+        'fused_channels': 64,
         'dropout': 0.7,
     },
-    'only_local': {
-        'use_global': False,
-        'use_partition': False,
+    'only_mid': {
+        'use_low': False,
+        'use_mid': True,
+        'use_high': False,
+        'use_global': True,
+        'use_partition': True,
         'use_local': True,
-        'fusion_mode': 'add',
-        'global_dilations': [1, 2, 5],
-        'partition_dilations': [1, 2, 5],
-        'local_dilations': [1, 2, 5],
-        'num_blocks': 4,
-        'base_channels': 48,
+        'low_channels': 16,
+        'mid_channels': 32,
+        'high_channels': 64,
+        'fused_channels': 64,
+        'dropout': 0.7,
+    },
+    'only_high': {
+        'use_low': False,
+        'use_mid': False,
+        'use_high': True,
+        'use_global': True,
+        'use_partition': True,
+        'use_local': True,
+        'low_channels': 16,
+        'mid_channels': 32,
+        'high_channels': 64,
+        'fused_channels': 64,
         'dropout': 0.7,
     },
     # Two branch ablations
-    'no_global': {
+    'no_low': {
+        'use_low': False,
+        'use_mid': True,
+        'use_high': True,
+        'use_global': True,
+        'use_partition': True,
+        'use_local': True,
+        'low_channels': 16,
+        'mid_channels': 32,
+        'high_channels': 64,
+        'fused_channels': 64,
+        'dropout': 0.7,
+    },
+    'no_mid': {
+        'use_low': True,
+        'use_mid': False,
+        'use_high': True,
+        'use_global': True,
+        'use_partition': True,
+        'use_local': True,
+        'low_channels': 16,
+        'mid_channels': 32,
+        'high_channels': 64,
+        'fused_channels': 64,
+        'dropout': 0.7,
+    },
+    'no_high': {
+        'use_low': True,
+        'use_mid': True,
+        'use_high': False,
+        'use_global': True,
+        'use_partition': True,
+        'use_local': True,
+        'low_channels': 16,
+        'mid_channels': 32,
+        'high_channels': 64,
+        'fused_channels': 64,
+        'dropout': 0.7,
+    },
+    # Perceptron ablations within blocks (all branches enabled, disable specific perceptrons)
+    'no_global_perc': {
+        'use_low': True,
+        'use_mid': True,
+        'use_high': True,
         'use_global': False,
         'use_partition': True,
         'use_local': True,
-        'fusion_mode': 'add',
-        'global_dilations': [1, 2, 5],
-        'partition_dilations': [1, 2, 5],
-        'local_dilations': [1, 2, 5],
-        'num_blocks': 4,
-        'base_channels': 48,
+        'low_channels': 16,
+        'mid_channels': 32,
+        'high_channels': 64,
+        'fused_channels': 64,
         'dropout': 0.7,
     },
-    'no_partition': {
+    'no_partition_perc': {
+        'use_low': True,
+        'use_mid': True,
+        'use_high': True,
         'use_global': True,
         'use_partition': False,
         'use_local': True,
-        'fusion_mode': 'add',
-        'global_dilations': [1, 2, 5],
-        'partition_dilations': [1, 2, 5],
-        'local_dilations': [1, 2, 5],
-        'num_blocks': 4,
-        'base_channels': 48,
+        'low_channels': 16,
+        'mid_channels': 32,
+        'high_channels': 64,
+        'fused_channels': 64,
         'dropout': 0.7,
     },
-    'no_local': {
+    'no_local_perc': {
+        'use_low': True,
+        'use_mid': True,
+        'use_high': True,
         'use_global': True,
         'use_partition': True,
         'use_local': False,
-        'fusion_mode': 'add',
-        'global_dilations': [1, 2, 5],
-        'partition_dilations': [1, 2, 5],
-        'local_dilations': [1, 2, 5],
-        'num_blocks': 4,
-        'base_channels': 48,
+        'low_channels': 16,
+        'mid_channels': 32,
+        'high_channels': 64,
+        'fused_channels': 64,
         'dropout': 0.7,
     },
-    # Fusion mode ablation
-    'fusion_concat': {
+    # Single perceptron ablations
+    'only_global_perc': {
+        'use_low': True,
+        'use_mid': True,
+        'use_high': True,
         'use_global': True,
-        'use_partition': True,
-        'use_local': True,
-        'fusion_mode': 'concat',
-        'global_dilations': [1, 2, 5],
-        'partition_dilations': [1, 2, 5],
-        'local_dilations': [1, 2, 5],
-        'num_blocks': 4,
-        'base_channels': 48,
+        'use_partition': False,
+        'use_local': False,
+        'low_channels': 16,
+        'mid_channels': 32,
+        'high_channels': 64,
+        'fused_channels': 64,
         'dropout': 0.7,
     },
-    # Dilation ablations
-    'dilation_1_only': {
-        'use_global': True,
+    'only_partition_perc': {
+        'use_low': True,
+        'use_mid': True,
+        'use_high': True,
+        'use_global': False,
         'use_partition': True,
-        'use_local': True,
-        'fusion_mode': 'add',
-        'global_dilations': [1],
-        'partition_dilations': [1],
-        'local_dilations': [1],
-        'num_blocks': 4,
-        'base_channels': 48,
+        'use_local': False,
+        'low_channels': 16,
+        'mid_channels': 32,
+        'high_channels': 64,
+        'fused_channels': 64,
         'dropout': 0.7,
     },
-    'dilation_137': {
-        'use_global': True,
-        'use_partition': True,
+    'only_local_perc': {
+        'use_low': True,
+        'use_mid': True,
+        'use_high': True,
+        'use_global': False,
+        'use_partition': False,
         'use_local': True,
-        'fusion_mode': 'add',
-        'global_dilations': [1, 3, 7],
-        'partition_dilations': [1, 3, 7],
-        'local_dilations': [1, 3, 7],
-        'num_blocks': 4,
-        'base_channels': 48,
+        'low_channels': 16,
+        'mid_channels': 32,
+        'high_channels': 64,
+        'fused_channels': 64,
         'dropout': 0.7,
     },
-    'dilation_15': {
-        'use_global': True,
-        'use_partition': True,
-        'use_local': True,
-        'fusion_mode': 'add',
-        'global_dilations': [1, 5],
-        'partition_dilations': [1, 5],
-        'local_dilations': [1, 5],
-        'num_blocks': 4,
-        'base_channels': 48,
-        'dropout': 0.7,
-    },
-    # Depth ablation
-    'shallow_2blocks': {
-        'use_global': True,
-        'use_partition': True,
-        'use_local': True,
-        'fusion_mode': 'add',
-        'global_dilations': [1, 2, 5],
-        'partition_dilations': [1, 2, 5],
-        'local_dilations': [1, 2, 5],
-        'num_blocks': 2,
-        'base_channels': 48,
-        'dropout': 0.7,
-    },
-    'deep_6blocks': {
-        'use_global': True,
-        'use_partition': True,
-        'use_local': True,
-        'fusion_mode': 'add',
-        'global_dilations': [1, 2, 5],
-        'partition_dilations': [1, 2, 5],
-        'local_dilations': [1, 2, 5],
-        'num_blocks': 6,
-        'base_channels': 48,
-        'dropout': 0.7,
-    },
-    # Width ablation
+    # Width ablations
     'narrow_32ch': {
+        'use_low': True,
+        'use_mid': True,
+        'use_high': True,
         'use_global': True,
         'use_partition': True,
         'use_local': True,
-        'fusion_mode': 'add',
-        'global_dilations': [1, 2, 5],
-        'partition_dilations': [1, 2, 5],
-        'local_dilations': [1, 2, 5],
-        'num_blocks': 4,
-        'base_channels': 32,
+        'low_channels': 8,
+        'mid_channels': 16,
+        'high_channels': 32,
+        'fused_channels': 32,
         'dropout': 0.7,
     },
     'wide_64ch': {
+        'use_low': True,
+        'use_mid': True,
+        'use_high': True,
         'use_global': True,
         'use_partition': True,
         'use_local': True,
-        'fusion_mode': 'add',
-        'global_dilations': [1, 2, 5],
-        'partition_dilations': [1, 2, 5],
-        'local_dilations': [1, 2, 5],
-        'num_blocks': 4,
-        'base_channels': 64,
+        'low_channels': 32,
+        'mid_channels': 64,
+        'high_channels': 128,
+        'fused_channels': 128,
         'dropout': 0.7,
+    },
+    # Fusion mode ablations
+    'fusion_concat': {
+        'use_low': True,
+        'use_mid': True,
+        'use_high': True,
+        'use_global': True,
+        'use_partition': True,
+        'use_local': True,
+        'low_channels': 16,
+        'mid_channels': 32,
+        'high_channels': 64,
+        'dropout': 0.7,
+        'fusion_mode': 'concat',
+        'branch_output_channels': 64,  # Each branch outputs 64 channels
+    },
+    # Dilation rate ablations for high branch
+    'dilation_137': {
+        'use_low': True,
+        'use_mid': True,
+        'use_high': True,
+        'use_global': True,
+        'use_partition': True,
+        'use_local': True,
+        'low_channels': 16,
+        'mid_channels': 32,
+        'high_channels': 64,
+        'fused_channels': 64,
+        'dropout': 0.7,
+        'dilation_rates': [1, 3, 7],
+    },
+    'dilation_15': {
+        'use_low': True,
+        'use_mid': True,
+        'use_high': True,
+        'use_global': True,
+        'use_partition': True,
+        'use_local': True,
+        'low_channels': 16,
+        'mid_channels': 32,
+        'high_channels': 64,
+        'fused_channels': 64,
+        'dropout': 0.7,
+        'dilation_rates': [1, 5],
+    },
+    'dilation_1_only': {
+        'use_low': True,
+        'use_mid': True,
+        'use_high': True,
+        'use_global': True,
+        'use_partition': True,
+        'use_local': True,
+        'low_channels': 16,
+        'mid_channels': 32,
+        'high_channels': 64,
+        'fused_channels': 64,
+        'dropout': 0.7,
+        'dilation_rates': [1],
+    },
+    # Full model variants for completeness
+    'full_dmlpffn': {
+        'use_low': True,
+        'use_mid': True,
+        'use_high': True,
+        'use_global': True,
+        'use_partition': True,
+        'use_local': True,
+        'low_channels': 16,
+        'mid_channels': 32,
+        'high_channels': 64,
+        'fused_channels': 64,
+        'dropout': 0.7,
+    },
+    'full_resnet_style': {
+        'use_low': True,
+        'use_mid': True,
+        'use_high': True,
+        'use_global': True,
+        'use_partition': True,
+        'use_local': True,
+        'low_channels': 16,
+        'mid_channels': 32,
+        'high_channels': 64,
+        'fused_channels': 64,
+        'dropout': 0.7,
+        'resnet_style_downsample': True,
+    },
+    'full_with_attention': {
+        'use_low': True,
+        'use_mid': True,
+        'use_high': True,
+        'use_global': True,
+        'use_partition': True,
+        'use_local': True,
+        'low_channels': 16,
+        'mid_channels': 32,
+        'high_channels': 64,
+        'fused_channels': 64,
+        'dropout': 0.7,
+        'use_attention': True,
+    },
+    'full_enhanced': {
+        'use_low': True,
+        'use_mid': True,
+        'use_high': True,
+        'use_global': True,
+        'use_partition': True,
+        'use_local': True,
+        'low_channels': 16,
+        'mid_channels': 32,
+        'high_channels': 64,
+        'fused_channels': 64,
+        'dropout': 0.7,
+        'enhanced_activation': True,
     },
 }
 
@@ -477,22 +761,16 @@ if __name__ == "__main__":
     print("Testing baseline factory...")
 
     # Test baseline models
-    for name in ['simplecnn', 'resnet18', 'mlp_mixer']:
+    for name in ['simple_cnn', 'resnet18_hsi', 'mlp_mixer_hsi', 'svm', 'random_forest']:
         model = get_baseline_model(name, in_channels=128, num_classes=4)
-        n_params = count_parameters(model)
-        print(f"  {name}: {n_params:,} params")
-
-    # Test classical ML
-    svm = get_baseline_model('svm')
-    rf = get_baseline_model('rf')
-    print(f"  svm: {type(svm).__name__}")
-    print(f"  rf: {type(rf).__name__}")
+        total_params, trainable_params = count_parameters(model)
+        print(f"  {name}: {total_params:,} params ({trainable_params:,} trainable)")
 
     # Test ablation models
     print("\nTesting DMLPFFN ablation models...")
-    for config_name in ['full', 'no_global', 'no_partition', 'no_local', 'only_global', 'fusion_concat', 'dilation_1_only']:
+    for config_name in ['full', 'no_global_perc', 'no_partition_perc', 'no_local_perc', 'only_global_perc', 'narrow_32ch', 'wide_64ch']:
         model = get_ablation_model(config_name, in_channels=128, num_classes=4, dropout=0.7)
-        n_params = count_parameters(model)
-        print(f"  {config_name}: {n_params:,} params")
+        total_params, trainable_params = count_parameters(model)
+        print(f"  {config_name}: {total_params:,} params ({trainable_params:,} trainable)")
 
     print("\nAll factory tests passed!")
